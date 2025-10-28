@@ -90,6 +90,27 @@ After you're done translating, you can import translations for all target cultur
 
 ![Import from Gridly](Documentation/ImportGridly.png)
 
+### Downloading Source Changes
+The **Download Source Changes** feature allows you to pull source string modifications from Gridly into Unreal Engine 5. This feature downloads source strings from Gridly per namespace, generates CSV files for each string table, and **automatically imports them into UE5's localization manifests**.
+ **Important**: This feature modifies source strings in your localization files. Review all changes before committing to version control.
+### Creating New String Tables from Gridly
+The **Download Source Changes** feature also supports creating new string tables directly from Gridly data. To create a new string table:
+1. **Set path for the new string tables**: You have to set a path in the plugin settings where the new string tables will be saved.
+2. **Enable Combined Namespace ID**: This feature only works when the "Use Combined Namespace Id" setting is enabled in the plugin settings.
+3. **Create a Path in Gridly**: Create a new path in your Grid. The path name will become the string table name in UE5.
+4. **Set Record ID Format**: Use the format `"StringTableName,Key"` for your record IDs, where:
+   - `StringTableName` is the desired name of your string table (must match the path name)
+   - `Key` is the unique identifier for the text entry
+   - Example: `"B_table,button_text"` or `"MainMenu,start_button"`
+5. **Organize Records**: Place all records that should belong to the same string table under the same path in Gridly.
+6. **Download Changes**: Use the "Download Source Changes" feature to automatically create the string table and import the entries.
+7. **Gather Text**: Use the Gather Text feature in the localization dashboard to gather content in the localization dashboard.
+**Example Setup**:
+- Gridly Path: `B_table`
+- Record IDs: `"B_table,button_text"`, `"B_table,title_text"`, `"B_table,description"`
+- Result: Creates a string table named `B_table` with the specified entries
+ **Note**: The string table name in UE5 will match exactly with your Gridly path name (no "StringTable_" prefix is added).
+
 ### Exporting Translations
 
 If you have existing translations in UE5.6, these can also be exported to Gridly with a single click (you usually only need to do this once).

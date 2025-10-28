@@ -17,6 +17,7 @@
 #include "Modules/ModuleManager.h"
 #include "AssetToolsModule.h"
 #include "ILocalizationServiceModule.h"
+#include "GridlyImportExportCommandlet.h"
 
 
 

@@ -598,7 +598,7 @@ bool FGridlyDataTableImporterJSON::ReadContainerEntry(const TSharedRef<FJsonValu
 			if (Error.Len() > 0)
 			{
 				ImportProblems.Add(FString::Printf(
-					TEXT("Problem assigning string '%s' to entry '%d' on property '%s' on row '%s' : %s"),
+					TEXT("Problem assigning string '%s' to entry %d on property '%s' on row '%s' : %s"), 
 					*PropertyValueString, InArrayEntryIndex, *InColumnName, *InRowName.ToString(), *Error));
 				return false;
 			}
@@ -620,8 +620,7 @@ bool FGridlyDataTableImporterJSON::ReadContainerEntry(const TSharedRef<FJsonValu
 		const FString Error = DataTableUtils::AssignStringToPropertyDirect(PropertyValue, InProperty, (uint8*) InPropertyData);
 		if (Error.Len() > 0)
 		{
-			ImportProblems.Add(FString::Printf(
-				TEXT("Problem assigning string '%s' to entry %d on property '%s' on row '%s' : %s"),
+			ImportProblems.Add(FString::Printf(TEXT("Problem assigning string '%s' to entry %d on property '%s' on row '%s' : %s"),
 				*PropertyValue, InArrayEntryIndex, *InColumnName, *InRowName.ToString(), *Error));
 			return false;
 		}

@@ -1,0 +1,1 @@
+"E:\work\Gridly\UE-enignes\UE_5.6\Engine\Binaries\Win64\UnrealEditor-Cmd.exe" "E:\work\Gridly\Unreal Projects\plugin56\Import_source_56\Import_source_56.uproject" -run=GridlyImportExportCommandlet -Config="E:\work\Gridly\Unreal Projects\plugin56\Import_source_56\Plugins\Gridly\Config\ImportExport.ini" -Section=DownloadSourceChanges

@@ -964,7 +964,7 @@ bool UGridlyImportExportCommandlet::ImportCSVToStringTable(ULocalizationTarget* 
 			UE_LOG(LogGridlyImportExportCommandlet, Display, TEXT("🔄 Using GridlyProvider to import %d entries for namespace '%s'"), KeyValuePairs.Num(), *Namespace);
 			
 			// Use the provider's function directly - this is the same function that the UI uses
-			bool bSuccess = GridlyProvider->ImportKeyValuePairsToStringTable(LocalizationTarget, Namespace, KeyValuePairs);
+			bool bSuccess = GridlyProvider->ImportKeyValuePairsToStringTable(LocalizationTarget, Namespace, KeyValuePairs, nullptr);
 			
 			if (bSuccess)
 			{

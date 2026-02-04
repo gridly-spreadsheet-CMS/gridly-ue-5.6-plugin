@@ -55,6 +55,8 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Editor.h"
 
+#include "GenericPlatform/GenericPlatformHttp.h"
+
 
 #if LOCALIZATION_SERVICES_WITH_SLATE
 #include "DetailCategoryBuilder.h"
@@ -1213,7 +1215,7 @@ void FGridlyLocalizationServiceProvider::DownloadSourceChangesFromGridlyInternal
 		return;
 	}
 
-	// Get the first view ID for import
+	// Get all view IDs for import
 	if (GameSettings->ImportFromViewIds.Num() == 0 || GameSettings->ImportFromViewIds[0].IsEmpty())
 	{
 		UE_LOG(LogGridlyLocalizationServiceProvider, Error, TEXT("❌ No import view ID configured"));
@@ -1221,25 +1223,74 @@ void FGridlyLocalizationServiceProvider::DownloadSourceChangesFromGridlyInternal
 		return;
 	}
 
-	const FString ViewId = GameSettings->ImportFromViewIds[0];
-	const FString Url = FString::Printf(TEXT("https://api.gridly.com/v1/views/%s/records"), *ViewId);
-
-	TSharedRef<IHttpRequest, ESPMode::ThreadSafe> HttpRequest = FHttpModule::Get().CreateRequest();
-	HttpRequest->SetVerb(TEXT("GET"));
-	HttpRequest->SetHeader(TEXT("Accept"), TEXT("application/json"));
-	HttpRequest->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
-	HttpRequest->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("ApiKey %s"), *ApiKey));
-	HttpRequest->SetURL(Url);
-
 	// Store the localization target and culture for the callback
 	CurrentSourceDownloadTarget = LocalizationTarget;
 	CurrentSourceDownloadCulture = NativeCulture;
 
-	HttpRequest->OnProcessRequestComplete().BindRaw(this, &FGridlyLocalizationServiceProvider::OnDownloadSourceChangesFromGridly);
-	HttpRequest->ProcessRequest();
+	// Initialize pagination variables
+	SourceChangesViewIds.Reset();
+	SourceChangesViewIds.Append(GameSettings->ImportFromViewIds);
+	CurrentSourceViewIdIndex = 0;
+	CurrentSourceOffset = 0;
+	SourceChangesLimit = GameSettings->ImportMaxRecordsPerRequest;
+	SourceChangesTotalCount = 0;
+	AccumulatedSourceRecords.Empty();
 
-	UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("🔄 Downloading source changes from Gridly for target: %s, culture: %s"), 
-		*LocalizationTarget->Settings.Name, *NativeCulture);
+	UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("🔄 Downloading source changes from Gridly for target: %s, culture: %s, views: %d"), 
+		*LocalizationTarget->Settings.Name, *NativeCulture, SourceChangesViewIds.Num());
+
+	// Start pagination
+	RequestSourceChangesPage(0, 0);
+}
+
+void FGridlyLocalizationServiceProvider::RequestSourceChangesPage(const int32 ViewIdIndex, const int32 Offset)
+{
+	CurrentSourceViewIdIndex = ViewIdIndex;
+	CurrentSourceOffset = Offset;
+
+	if (SourceChangesViewIds.Num() == 0)
+	{
+		UE_LOG(LogGridlyLocalizationServiceProvider, Error, TEXT("❌ No view IDs available for source changes download"));
+		FMessageDialog::Open(EAppMsgType::Ok, FText::FromString(TEXT("❌ No view IDs available for source changes download.")));
+		return;
+	}
+
+	if (ViewIdIndex < SourceChangesViewIds.Num())
+	{
+		const FString& ViewId = SourceChangesViewIds[ViewIdIndex];
+		const UGridlyGameSettings* GameSettings = GetMutableDefault<UGridlyGameSettings>();
+		const FString ApiKey = GameSettings->ImportApiKey;
+
+		// Build URL with pagination
+		const FString PaginationSettings = FGenericPlatformHttp::UrlEncode(FString::Printf(TEXT("{\"offset\":%d,\"limit\":%d}"),
+			Offset,
+			SourceChangesLimit));
+
+		FStringFormatNamedArguments Args;
+		Args.Add(TEXT("ViewId"), *ViewId);
+		Args.Add(TEXT("PaginationSettings"), *PaginationSettings);
+		const FString Url = FString::Format(TEXT("https://api.gridly.com/v1/views/{ViewId}/records?page={PaginationSettings}"),
+			Args);
+
+		CurrentSourceChangesHttpRequest = FHttpModule::Get().CreateRequest();
+		CurrentSourceChangesHttpRequest->SetVerb(TEXT("GET"));
+		CurrentSourceChangesHttpRequest->SetHeader(TEXT("Accept"), TEXT("application/json"));
+		CurrentSourceChangesHttpRequest->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+		CurrentSourceChangesHttpRequest->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("ApiKey %s"), *ApiKey));
+		CurrentSourceChangesHttpRequest->SetURL(Url);
+
+		CurrentSourceChangesHttpRequest->OnProcessRequestComplete().BindRaw(this, &FGridlyLocalizationServiceProvider::OnDownloadSourceChangesFromGridly);
+		CurrentSourceChangesHttpRequest->ProcessRequest();
+
+		UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("🔄 Requesting source changes - view ID: %s (index %d), offset: %d, limit: %d"), 
+			*ViewId, ViewIdIndex, Offset, SourceChangesLimit);
+	}
+	else
+	{
+		// All view IDs have been processed, finalize by processing collected records
+		UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("✅ All view IDs processed for source changes download. Processing %d namespaces"), AccumulatedSourceRecords.Num());
+		ProcessSourceChangesForNamespaces(AccumulatedSourceRecords);
+	}
 }
 
 void FGridlyLocalizationServiceProvider::OnDownloadSourceChangesFromGridly(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bSuccess)
@@ -1257,15 +1308,32 @@ void FGridlyLocalizationServiceProvider::OnDownloadSourceChangesFromGridly(FHttp
 	TArray<TSharedPtr<FJsonValue>> RecordsArray;
 	TSharedRef<TJsonReader<TCHAR>> JsonReader = TJsonReaderFactory<TCHAR>::Create(ResponseContent);
 	
-	if (!FJsonSerializer::Deserialize(JsonReader, RecordsArray) || RecordsArray.Num() == 0)
+	if (!FJsonSerializer::Deserialize(JsonReader, RecordsArray))
 	{
 		UE_LOG(LogGridlyLocalizationServiceProvider, Error, TEXT("❌ Failed to parse JSON response from Gridly"));
 		FMessageDialog::Open(EAppMsgType::Ok, FText::FromString(TEXT("❌ Failed to parse response from Gridly.")));
 		return;
 	}
 
+	// If response is empty, check if we should move to next view or finish
+	if (RecordsArray.Num() == 0)
+	{
+		UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("⚠️ Empty response for view index %d, offset %d"), CurrentSourceViewIdIndex, CurrentSourceOffset);
+		
+		// If this is the first request for a view, move to next view; otherwise we're done with this view
+		if (CurrentSourceOffset == 0)
+		{
+			RequestSourceChangesPage(CurrentSourceViewIdIndex + 1, 0);
+		}
+		else
+		{
+			// Move to next view
+			RequestSourceChangesPage(CurrentSourceViewIdIndex + 1, 0);
+		}
+		return;
+	}
+
 	// Group records by namespace (path column)
-	TMap<FString, TArray<FGridlySourceRecord>> NamespaceRecords;
 	const UGridlyGameSettings* GameSettings = GetMutableDefault<UGridlyGameSettings>();
 
 	for (const TSharedPtr<FJsonValue>& RecordValue : RecordsArray)
@@ -1349,14 +1417,31 @@ void FGridlyLocalizationServiceProvider::OnDownloadSourceChangesFromGridly(FHttp
 			
 			if (!Namespace.IsEmpty())
 			{
-				NamespaceRecords.FindOrAdd(Namespace).Add(SourceRecord);
+				AccumulatedSourceRecords.FindOrAdd(Namespace).Add(SourceRecord);
 			}
 		}
 	}
 
-	// Generate CSV files for each namespace and update string tables
-	ProcessSourceChangesForNamespaces(NamespaceRecords);
+	// Check if there are more pages for this view
+	const FString TotalCountHeader = Response->GetHeader("X-Total-Count");
+	const int32 ViewTotalCount = TotalCountHeader.IsEmpty() ? 0 : FCString::Atoi(*TotalCountHeader);
+
+	UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("📊 View index %d: received %d records, total count: %d, current offset: %d"), 
+		CurrentSourceViewIdIndex, RecordsArray.Num(), ViewTotalCount, CurrentSourceOffset);
+
+	// Check if we need to fetch more pages for the current view
+	if ((CurrentSourceOffset + SourceChangesLimit) < ViewTotalCount)
+	{
+		// More pages available for this view
+		RequestSourceChangesPage(CurrentSourceViewIdIndex, CurrentSourceOffset + SourceChangesLimit);
+	}
+	else
+	{
+		// Done with this view, move to the next one
+		RequestSourceChangesPage(CurrentSourceViewIdIndex + 1, 0);
+	}
 }
+
 
 void FGridlyLocalizationServiceProvider::ProcessSourceChangesForNamespaces(const TMap<FString, TArray<FGridlySourceRecord>>& NamespaceRecords)
 {
@@ -1380,6 +1465,9 @@ void FGridlyLocalizationServiceProvider::ProcessSourceChangesForNamespaces(const
 
 	int32 ProcessedNamespaces = 0;
 	int32 TotalNamespaces = NamespaceRecords.Num();
+	TArray<FString> UpdatedNamespaces;
+	TArray<FString> CreatedNamespaces;
+	TArray<FString> UnchangedNamespaces;
 
 	for (const auto& NamespacePair : NamespaceRecords)
 	{
@@ -1410,7 +1498,26 @@ void FGridlyLocalizationServiceProvider::ProcessSourceChangesForNamespaces(const
 			UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("✅ Generated CSV file for namespace '%s': %s"), *Namespace, *CSVFilePath);
 			
 			// Import the CSV into the string table
-			ImportCSVToStringTable(LocalizationTarget, Namespace, CSVFilePath);
+			FImportKeyValuePairsStats ImportStats;
+			const bool bImportSuccess = ImportCSVToStringTable(LocalizationTarget, Namespace, CSVFilePath, &ImportStats);
+			if (bImportSuccess)
+			{
+				if (ImportStats.bStringTableCreated)
+				{
+					CreatedNamespaces.Add(Namespace);
+					continue;
+				}
+
+				if (ImportStats.Updated > 0 || ImportStats.Created > 0)
+				{
+					UpdatedNamespaces.Add(Namespace);
+				}
+
+				if (ImportStats.Updated == 0 && ImportStats.Created == 0)
+				{
+					UnchangedNamespaces.Add(Namespace);
+				}
+			}
 		}
 		else
 		{
@@ -1419,14 +1526,25 @@ void FGridlyLocalizationServiceProvider::ProcessSourceChangesForNamespaces(const
 	}
 
 	// Show completion message
-	FString Message = FString::Printf(TEXT("✅ Source changes processing completed!\n\n📊 Processed %d namespaces\n📁 CSV files saved to: %s\n\n🎉 String tables updated!\n• Source strings have been imported directly into string table assets\n• String table UI should now show the updated/new entries\n• String tables are marked as modified and need to be saved\n\n📝 Next Steps:\n• Review changes in the string table editor\n• Save the modified string table assets\n• Run 'Gather Text' from the Localization Dashboard to update manifest files\n• Commit changes to version control\n\n⚠️ Note: This feature modifies source strings. Review changes before committing."), 
-		ProcessedNamespaces, *TempDir);
+	const FString UpdatedNamespacesList = UpdatedNamespaces.Num() > 0 ? FString::Join(UpdatedNamespaces, TEXT(", ")) : TEXT("None");
+	const FString CreatedNamespacesList = CreatedNamespaces.Num() > 0 ? FString::Join(CreatedNamespaces, TEXT(", ")) : TEXT("None");
+	const FString UnchangedNamespacesList = UnchangedNamespaces.Num() > 0 ? FString::Join(UnchangedNamespaces, TEXT(", ")) : TEXT("None");
+
+	FString Message = FString::Printf(TEXT("✅ Source changes processing completed!\n\n📊 Processed %d namespaces\n📁 CSV files saved to: %s\n\n📈 Namespace summary\n• Updated namespaces: %d\n• Created namespaces: %d\n• Unchanged namespaces: %d\n• Namespaces updated: %s\n• Namespaces created: %s\n• Namespaces unchanged: %s\n\n🎉 String tables updated!\n• Source strings have been imported directly into string table assets\n• String table UI should now show the updated/new entries\n• String tables are marked as modified and need to be saved\n\n📝 Next Steps:\n• Review changes in the string table editor\n• Save the modified string table assets\n• Run 'Gather Text' from the Localization Dashboard to update manifest files\n• Commit changes to version control\n\n⚠️ Note: This feature modifies source strings. Review changes before committing."),
+		ProcessedNamespaces,
+		*TempDir,
+		UpdatedNamespaces.Num(),
+		CreatedNamespaces.Num(),
+		UnchangedNamespaces.Num(),
+		*UpdatedNamespacesList,
+		*CreatedNamespacesList,
+		*UnchangedNamespacesList);
 	
 	UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("%s"), *Message);
 	FMessageDialog::Open(EAppMsgType::Ok, FText::FromString(Message));
 }
 
-bool FGridlyLocalizationServiceProvider::ImportCSVToStringTable(ULocalizationTarget* LocalizationTarget, const FString& Namespace, const FString& CSVFilePath)
+bool FGridlyLocalizationServiceProvider::ImportCSVToStringTable(ULocalizationTarget* LocalizationTarget, const FString& Namespace, const FString& CSVFilePath, FImportKeyValuePairsStats* OutStats)
 {
 	UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("📄 CSV file ready for import: %s"), *CSVFilePath);
 	UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("🏷️ Namespace: %s, Target: %s"), *Namespace, *LocalizationTarget->Settings.Name);
@@ -1531,7 +1649,7 @@ bool FGridlyLocalizationServiceProvider::ImportCSVToStringTable(ULocalizationTar
 	ManifestPath = FPaths::ConvertRelativePathToFull(ManifestPath);
 
 	// Import into string table using the passed localization target
-	bool bSuccess = ImportKeyValuePairsToStringTable(LocalizationTarget, Namespace, KeyValuePairs);
+	bool bSuccess = ImportKeyValuePairsToStringTable(LocalizationTarget, Namespace, KeyValuePairs, OutStats);
 	
 	if (bSuccess)
 	{
@@ -1603,10 +1721,14 @@ void FGridlyLocalizationServiceProvider::ParseCSVLine(const FString& Line, TArra
 	OutFields.Add(CurrentField);
 }
 
-bool FGridlyLocalizationServiceProvider::ImportKeyValuePairsToStringTable(ULocalizationTarget* LocalizationTarget, const FString& Namespace, const TMap<FString, FString>& KeyValuePairs)
+bool FGridlyLocalizationServiceProvider::ImportKeyValuePairsToStringTable(ULocalizationTarget* LocalizationTarget, const FString& Namespace, const TMap<FString, FString>& KeyValuePairs, FImportKeyValuePairsStats* OutStats)
 {
 	if (KeyValuePairs.Num() == 0)
 	{
+		if (OutStats)
+		{
+			*OutStats = FImportKeyValuePairsStats{};
+		}
 		UE_LOG(LogGridlyLocalizationServiceProvider, Warning, TEXT("⚠️ No key-value pairs to import for namespace: %s"), *Namespace);
 		return true;
 	}
@@ -1615,14 +1737,23 @@ bool FGridlyLocalizationServiceProvider::ImportKeyValuePairsToStringTable(ULocal
 
 	if (!LocalizationTarget)
 	{
+		if (OutStats)
+		{
+			*OutStats = FImportKeyValuePairsStats{};
+		}
 		UE_LOG(LogGridlyLocalizationServiceProvider, Error, TEXT("❌ Invalid localization target"));
 		return false;
 	}
 
 	// Find or create string table asset for this namespace
-	UStringTable* StringTable = FindOrCreateStringTable(Namespace);
+	bool bStringTableCreated = false;
+	UStringTable* StringTable = FindOrCreateStringTable(Namespace, bStringTableCreated);
 	if (!StringTable)
 	{
+		if (OutStats)
+		{
+			*OutStats = FImportKeyValuePairsStats{};
+		}
 		UE_LOG(LogGridlyLocalizationServiceProvider, Error, TEXT("❌ Failed to find or create string table for namespace: %s"), *Namespace);
 		return false;
 	}
@@ -1633,6 +1764,7 @@ bool FGridlyLocalizationServiceProvider::ImportKeyValuePairsToStringTable(ULocal
 	int32 ImportedCount = 0;
 	int32 UpdatedCount = 0;
 	int32 CreatedCount = 0;
+	int32 SkippedCount = 0;
 
 	for (const auto& KeyValuePair : KeyValuePairs)
 	{
@@ -1648,6 +1780,12 @@ bool FGridlyLocalizationServiceProvider::ImportKeyValuePairsToStringTable(ULocal
 		
 		if (bExists)
 		{
+			if (ExistingValue == Value)
+			{
+				SkippedCount++;
+				continue;
+			}
+
 			// Update existing entry
 			MutableStringTable.SetSourceString(Key, Value);
 			UpdatedCount++;
@@ -1660,8 +1798,23 @@ bool FGridlyLocalizationServiceProvider::ImportKeyValuePairsToStringTable(ULocal
 			CreatedCount++;
 			UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("🆕 Created new entry: %s = %s"), *Key, *Value);
 		}
-		
+
 		ImportedCount++;
+	}
+
+	if (OutStats)
+	{
+		OutStats->Updated = UpdatedCount;
+		OutStats->Created = CreatedCount;
+		OutStats->Unchanged = SkippedCount;
+		OutStats->Imported = ImportedCount;
+		OutStats->bStringTableCreated = bStringTableCreated;
+	}
+
+	if (UpdatedCount == 0 && CreatedCount == 0)
+	{
+		UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("✅ No changes detected for namespace '%s' (%d entries matched). Skipping modifications."), *Namespace, SkippedCount);
+		return true;
 	}
 
 	// Mark the string table as modified and save it
@@ -1676,14 +1829,15 @@ bool FGridlyLocalizationServiceProvider::ImportKeyValuePairsToStringTable(ULocal
 	// Mark the asset as dirty so user knows it needs saving
 	StringTable->MarkPackageDirty();
 
-	UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("✅ Imported %d/%d entries for namespace '%s' (%d updated, %d created)"), 
-		ImportedCount, KeyValuePairs.Num(), *Namespace, UpdatedCount, CreatedCount);
+	UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("✅ Imported %d/%d entries for namespace '%s' (%d updated, %d created, %d unchanged)"), 
+		ImportedCount, KeyValuePairs.Num(), *Namespace, UpdatedCount, CreatedCount, SkippedCount);
 	
 	return true;
 }
 
-UStringTable* FGridlyLocalizationServiceProvider::FindOrCreateStringTable(const FString& Namespace)
+UStringTable* FGridlyLocalizationServiceProvider::FindOrCreateStringTable(const FString& Namespace, bool& bOutStringTableCreated)
 {
+	bOutStringTableCreated = false;
 	// Try to find existing string table
 	FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
 	
@@ -1716,12 +1870,12 @@ UStringTable* FGridlyLocalizationServiceProvider::FindOrCreateStringTable(const 
 	
 			
 			// Check for exact namespace match in the name or path
-			if (StringTableName == Namespace || 
-				StringTableName.EndsWith(FString::Printf(TEXT("_%s"), *Namespace)) ||
-				StringTablePath.Contains(FString::Printf(TEXT("/%s."), *Namespace)) ||
-				StringTablePath.Contains(FString::Printf(TEXT("/%s/"), *Namespace)) ||
-				StringTablePath.EndsWith(FString::Printf(TEXT("/%s"), *Namespace)) ||
-				StringTablePath.Contains(FString::Printf(TEXT("/%s"), *Namespace)))
+			const FString ExactObjectToken = FString::Printf(TEXT("/%s."), *Namespace);
+			const FString ExactFolderToken = FString::Printf(TEXT("/%s/"), *Namespace);
+
+			if (StringTableName == Namespace ||
+				StringTablePath.Contains(ExactObjectToken) ||
+				StringTablePath.Contains(ExactFolderToken))
 			{
 				UE_LOG(LogGridlyLocalizationServiceProvider, Display, TEXT("📋 Found existing string table: %s for namespace: %s"), *StringTable->GetPathName(), *Namespace);
 				return StringTable;
@@ -1774,7 +1928,9 @@ UStringTable* FGridlyLocalizationServiceProvider::FindOrCreateStringTable(const 
 		UE_LOG(LogGridlyLocalizationServiceProvider, Error, TEXT("❌ Failed to create string table asset: %s"), *AssetName);
 		return nullptr;
 	}
-	
+
+	bOutStringTableCreated = true;
+
 	// Register the asset with the asset registry
 	FAssetRegistryModule::AssetCreated(StringTable);
 	

@@ -39,13 +39,22 @@ class FGridlyLocalizationServiceProvider final : public ILocalizationServiceProv
 			: RecordId(TEXT("")), Path(TEXT("")), SourceText(TEXT(""))
 		{}
 	};
-public:
-	FGridlyLocalizationServiceProvider();
-	bool bHasDeletesPending = false;
-	
-	// Manifest handling functions
-	bool ImportKeyValuePairsToStringTable(ULocalizationTarget* LocalizationTarget, const FString& Namespace, const TMap<FString, FString>& KeyValuePairs);
-	bool HasDeleteRequestsPending() const;
+	struct FImportKeyValuePairsStats
+	{
+		int32 Updated = 0;
+		int32 Created = 0;
+		int32 Unchanged = 0;
+		int32 Imported = 0;
+		bool bStringTableCreated = false;
+	};
+
+	public:
+		FGridlyLocalizationServiceProvider();
+		bool bHasDeletesPending = false;
+		
+		// Manifest handling functions
+		bool ImportKeyValuePairsToStringTable(ULocalizationTarget* LocalizationTarget, const FString& Namespace, const TMap<FString, FString>& KeyValuePairs, FImportKeyValuePairsStats* OutStats = nullptr);
+		bool HasDeleteRequestsPending() const;
 
 public:
 	/* ILocalizationServiceProvider implementation */
@@ -137,19 +146,27 @@ public:
 	// Source changes download tracking
 	TWeakObjectPtr<ULocalizationTarget> CurrentSourceDownloadTarget;
 	FString CurrentSourceDownloadCulture;
+	TArray<FString> SourceChangesViewIds;
+	int32 CurrentSourceViewIdIndex;
+	int32 CurrentSourceOffset;
+	int32 SourceChangesLimit;
+	int32 SourceChangesTotalCount;
+	TSharedPtr<IHttpRequest, ESPMode::ThreadSafe> CurrentSourceChangesHttpRequest;
+	TMap<FString, TArray<FGridlySourceRecord>> AccumulatedSourceRecords; // Accumulate records across paginated requests
 public:
 	void DownloadSourceChangesFromGridlyInternal(TWeakObjectPtr<ULocalizationTarget> LocalizationTarget, const FString& NativeCulture);
+	void RequestSourceChangesPage(const int32 ViewIdIndex, const int32 Offset);
 	void ProcessSourceChangesForNamespaces(const TMap<FString, TArray<FGridlySourceRecord>>& NamespaceRecords);
-	bool ImportCSVToStringTable(ULocalizationTarget* LocalizationTarget, const FString& Namespace, const FString& CSVFilePath);
+	bool ImportCSVToStringTable(ULocalizationTarget* LocalizationTarget, const FString& Namespace, const FString& CSVFilePath, FImportKeyValuePairsStats* OutStats = nullptr);
 	void ParseCSVLine(const FString& Line, TArray<FString>& OutFields);
 	
 
 	
 	// String table helper functions
-	UStringTable* FindOrCreateStringTable(const FString& Namespace);
+	UStringTable* FindOrCreateStringTable(const FString& Namespace, bool& bOutStringTableCreated);
 	
 
 
 	int32 CompletedBatches;         // Track the number of completed batches
-	int32 TotalBatchesToProcess;    // Track the total number of batches
-};
+		int32 TotalBatchesToProcess;    // Track the total number of batches
+	};

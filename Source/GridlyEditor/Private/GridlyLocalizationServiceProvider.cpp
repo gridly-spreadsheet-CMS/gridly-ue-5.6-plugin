@@ -41,6 +41,7 @@
 #include "Interfaces/IHttpRequest.h"
 #include "Internationalization/Text.h"
 #include "LocalizationTargetTypes.h"
+#include "GenericPlatform/GenericPlatformHttp.h"
 #include "Misc/MessageDialog.h"
 #include "Misc/Paths.h"
 #include "ToolMenus.h"
@@ -1222,7 +1223,15 @@ void FGridlyLocalizationServiceProvider::DownloadSourceChangesFromGridlyInternal
 	}
 
 	const FString ViewId = GameSettings->ImportFromViewIds[0];
-	const FString Url = FString::Printf(TEXT("https://api.gridly.com/v1/views/%s/records"), *ViewId);
+	const int32 Limit = FMath::Clamp(GameSettings->ImportMaxRecordsPerRequest, 1, 1000);
+
+	// Pagination: start at offset 0 so we fetch all records (all namespaces), not just the first page
+	CurrentSourceDownloadOffset = 0;
+	CurrentSourceDownloadTotalCount = 0;
+	AccumulatedSourceDownloadNamespaceRecords.Reset();
+
+	const FString PaginationSettings = FGenericPlatformHttp::UrlEncode(FString::Printf(TEXT("{\"offset\":%d,\"limit\":%d}"), 0, Limit));
+	const FString Url = FString::Printf(TEXT("https://api.gridly.com/v1/views/%s/records?page=%s"), *ViewId, *PaginationSettings);
 
 	TSharedRef<IHttpRequest, ESPMode::ThreadSafe> HttpRequest = FHttpModule::Get().CreateRequest();
 	HttpRequest->SetVerb(TEXT("GET"));
@@ -1231,14 +1240,13 @@ void FGridlyLocalizationServiceProvider::DownloadSourceChangesFromGridlyInternal
 	HttpRequest->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("ApiKey %s"), *ApiKey));
 	HttpRequest->SetURL(Url);
 
-	// Store the localization target and culture for the callback
 	CurrentSourceDownloadTarget = LocalizationTarget;
 	CurrentSourceDownloadCulture = NativeCulture;
 
 	HttpRequest->OnProcessRequestComplete().BindRaw(this, &FGridlyLocalizationServiceProvider::OnDownloadSourceChangesFromGridly);
 	HttpRequest->ProcessRequest();
 
-	UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("🔄 Downloading source changes from Gridly for target: %s, culture: %s"), 
+	UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("🔄 Downloading source changes from Gridly for target: %s, culture: %s (paginated)"), 
 		*LocalizationTarget->Settings.Name, *NativeCulture);
 }
 
@@ -1252,21 +1260,41 @@ void FGridlyLocalizationServiceProvider::OnDownloadSourceChangesFromGridly(FHttp
 	}
 
 	const FString ResponseContent = Response->GetContentAsString();
-	
-	// Parse the JSON response to get the records
+
+	// Total count from Gridly (for pagination)
+	if (CurrentSourceDownloadTotalCount <= 0)
+	{
+		const FString TotalCountHeader = Response->GetHeader(TEXT("X-Total-Count"));
+		if (!TotalCountHeader.IsEmpty())
+		{
+			CurrentSourceDownloadTotalCount = FCString::Atoi(*TotalCountHeader);
+			UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("📥 Gridly reports %d total records (fetching all pages for all namespaces)"), CurrentSourceDownloadTotalCount);
+		}
+	}
+
+	// Parse the JSON response to get the records for this page
 	TArray<TSharedPtr<FJsonValue>> RecordsArray;
 	TSharedRef<TJsonReader<TCHAR>> JsonReader = TJsonReaderFactory<TCHAR>::Create(ResponseContent);
-	
-	if (!FJsonSerializer::Deserialize(JsonReader, RecordsArray) || RecordsArray.Num() == 0)
+
+	if (!FJsonSerializer::Deserialize(JsonReader, RecordsArray))
 	{
 		UE_LOG(LogGridlyLocalizationServiceProvider, Error, TEXT("❌ Failed to parse JSON response from Gridly"));
 		FMessageDialog::Open(EAppMsgType::Ok, FText::FromString(TEXT("❌ Failed to parse response from Gridly.")));
 		return;
 	}
 
-	// Group records by namespace (path column)
-	TMap<FString, TArray<FGridlySourceRecord>> NamespaceRecords;
+	// Empty page is valid (e.g. last page)
+	if (RecordsArray.Num() == 0 && AccumulatedSourceDownloadNamespaceRecords.Num() == 0)
+	{
+		UE_LOG(LogGridlyLocalizationServiceProvider, Warning, TEXT("⚠️ No records returned from Gridly"));
+		ProcessSourceChangesForNamespaces(AccumulatedSourceDownloadNamespaceRecords);
+		return;
+	}
+
 	const UGridlyGameSettings* GameSettings = GetMutableDefault<UGridlyGameSettings>();
+
+	// Group this page's records by namespace (path column)
+	TMap<FString, TArray<FGridlySourceRecord>> PageNamespaceRecords;
 
 	for (const TSharedPtr<FJsonValue>& RecordValue : RecordsArray)
 	{
@@ -1285,14 +1313,14 @@ void FGridlyLocalizationServiceProvider::OnDownloadSourceChangesFromGridly(FHttp
 			SourceRecord.RecordId = RecordId;
 		}
 
-		// Extract path (namespace)
+		// Extract path (namespace): try top-level "path" first, then path column in cells (NamespaceColumnId)
 		FString Path;
 		if ((*RecordObject)->TryGetStringField(FString(TEXT("path")), Path))
 		{
 			SourceRecord.Path = Path;
 		}
 
-		// Extract source text from the native culture column
+		// Extract source text and path (namespace) from cells
 		const TArray<TSharedPtr<FJsonValue>>* CellsArray;
 		if ((*RecordObject)->TryGetArrayField(TEXT("cells"), CellsArray))
 		{
@@ -1307,8 +1335,13 @@ void FGridlyLocalizationServiceProvider::OnDownloadSourceChangesFromGridly(FHttp
 					if ((*CellObject)->TryGetStringField(FString(TEXT("columnId")), ColumnId) && 
 						(*CellObject)->TryGetStringField(FString(TEXT("value")), Value))
 					{
-						// Check if this is the source language column
-						if (ColumnId.StartsWith(GameSettings->SourceLanguageColumnIdPrefix))
+						// Path/namespace from the path column (NamespaceColumnId) — supports all paths, not just top-level path
+						if (!GameSettings->NamespaceColumnId.IsEmpty() && ColumnId == GameSettings->NamespaceColumnId)
+						{
+							SourceRecord.Path = Value;
+						}
+						// Source language column
+						else if (ColumnId.StartsWith(GameSettings->SourceLanguageColumnIdPrefix))
 						{
 							const FString GridlyCulture = ColumnId.RightChop(GameSettings->SourceLanguageColumnIdPrefix.Len());
 							FString Culture;
@@ -1349,13 +1382,46 @@ void FGridlyLocalizationServiceProvider::OnDownloadSourceChangesFromGridly(FHttp
 			
 			if (!Namespace.IsEmpty())
 			{
-				NamespaceRecords.FindOrAdd(Namespace).Add(SourceRecord);
+				PageNamespaceRecords.FindOrAdd(Namespace).Add(SourceRecord);
 			}
 		}
 	}
 
-	// Generate CSV files for each namespace and update string tables
-	ProcessSourceChangesForNamespaces(NamespaceRecords);
+	// Merge this page into accumulated records (so we have all namespaces across all pages)
+	for (const auto& Pair : PageNamespaceRecords)
+	{
+		TArray<FGridlySourceRecord>& Accumulated = AccumulatedSourceDownloadNamespaceRecords.FindOrAdd(Pair.Key);
+		Accumulated.Append(Pair.Value);
+	}
+
+	const int32 Limit = FMath::Clamp(GameSettings->ImportMaxRecordsPerRequest, 1, 1000);
+	const int32 NextOffset = CurrentSourceDownloadOffset + Limit;
+	// Fetch next page if we got a full page and (we don't know total, or total is beyond next offset)
+	const bool bHasMore = (RecordsArray.Num() >= Limit) && (CurrentSourceDownloadTotalCount <= 0 || NextOffset < CurrentSourceDownloadTotalCount);
+
+	if (bHasMore)
+	{
+		CurrentSourceDownloadOffset = NextOffset;
+		UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("📥 Fetching next page (offset %d, total %d)"), CurrentSourceDownloadOffset, CurrentSourceDownloadTotalCount);
+
+		const FString ViewId = GameSettings->ImportFromViewIds[0];
+		const FString PaginationSettings = FGenericPlatformHttp::UrlEncode(FString::Printf(TEXT("{\"offset\":%d,\"limit\":%d}"), CurrentSourceDownloadOffset, Limit));
+		const FString Url = FString::Printf(TEXT("https://api.gridly.com/v1/views/%s/records?page=%s"), *ViewId, *PaginationSettings);
+
+		TSharedRef<IHttpRequest, ESPMode::ThreadSafe> HttpRequest = FHttpModule::Get().CreateRequest();
+		HttpRequest->SetVerb(TEXT("GET"));
+		HttpRequest->SetHeader(TEXT("Accept"), TEXT("application/json"));
+		HttpRequest->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+		HttpRequest->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("ApiKey %s"), *GameSettings->ImportApiKey));
+		HttpRequest->SetURL(Url);
+		HttpRequest->OnProcessRequestComplete().BindRaw(this, &FGridlyLocalizationServiceProvider::OnDownloadSourceChangesFromGridly);
+		HttpRequest->ProcessRequest();
+		return;
+	}
+
+	// All pages fetched — generate CSV files and update string tables for all namespaces
+	UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("📥 Fetched %d namespaces from %d total records"), AccumulatedSourceDownloadNamespaceRecords.Num(), CurrentSourceDownloadTotalCount);
+	ProcessSourceChangesForNamespaces(AccumulatedSourceDownloadNamespaceRecords);
 }
 
 void FGridlyLocalizationServiceProvider::ProcessSourceChangesForNamespaces(const TMap<FString, TArray<FGridlySourceRecord>>& NamespaceRecords)
@@ -1694,38 +1760,60 @@ UStringTable* FGridlyLocalizationServiceProvider::FindOrCreateStringTable(const 
 	TArray<FAssetData> AssetList;
 	AssetRegistryModule.Get().GetAssets(Filter, AssetList);
 	
-	// Look for a string table with the exact namespace match
+	// Look for a string table that matches the namespace: prefer exact name match so we only resolve the right table
 	for (const FAssetData& AssetData : AssetList)
 	{
 		UStringTable* StringTable = Cast<UStringTable>(AssetData.GetAsset());
-		if (StringTable)
+		if (!StringTable)
 		{
-			// Get the string table name and check for exact namespace match
-			FString StringTableName = StringTable->GetName();
-			FString StringTablePath = StringTable->GetPathName();
-			
-			UE_LOG(LogGridlyLocalizationServiceProvider, Display, TEXT("🔍 Checking string table: %s (name: %s) for namespace: %s"), *StringTablePath, *StringTableName, *Namespace);
-	
-	// Special check for new_table_56 to prioritize the actual file (not the duplicate)
-	if (Namespace == TEXT("new_table_56") && StringTablePath.Contains(TEXT("new_table_56")) && !StringTablePath.Contains(TEXT("new_table_56.new_table_56")))
-	{
-		UE_LOG(LogGridlyLocalizationServiceProvider, Display, TEXT("🎯 PRIORITY MATCH: Found string table: %s for namespace: %s"), *StringTable->GetPathName(), *Namespace);
-		return StringTable;
+			continue;
+		}
+
+		FString StringTableName = StringTable->GetName();
+		FString StringTablePath = StringTable->GetPathName();
+
+		// Special check for new_table_56 to prioritize the actual file (not the duplicate)
+		if (Namespace == TEXT("new_table_56") && StringTablePath.Contains(TEXT("new_table_56")) && !StringTablePath.Contains(TEXT("new_table_56.new_table_56")))
+		{
+			UE_LOG(LogGridlyLocalizationServiceProvider, Display, TEXT("🎯 PRIORITY MATCH: Found string table: %s for namespace: %s"), *StringTable->GetPathName(), *Namespace);
+			return StringTable;
+		}
+
+		// Exact name match: namespace "Items" -> string table named "Items" (no need to check other tables)
+		if (StringTableName == Namespace)
+		{
+			UE_LOG(LogGridlyLocalizationServiceProvider, Display, TEXT("📋 Found existing string table: %s for namespace: %s"), *StringTablePath, *Namespace);
+			return StringTable;
+		}
 	}
-	
-	
-			
-			// Check for exact namespace match in the name or path
-			if (StringTableName == Namespace || 
-				StringTableName.EndsWith(FString::Printf(TEXT("_%s"), *Namespace)) ||
-				StringTablePath.Contains(FString::Printf(TEXT("/%s."), *Namespace)) ||
-				StringTablePath.Contains(FString::Printf(TEXT("/%s/"), *Namespace)) ||
-				StringTablePath.EndsWith(FString::Printf(TEXT("/%s"), *Namespace)) ||
-				StringTablePath.Contains(FString::Printf(TEXT("/%s"), *Namespace)))
-			{
-				UE_LOG(LogGridlyLocalizationServiceProvider, Display, TEXT("📋 Found existing string table: %s for namespace: %s"), *StringTable->GetPathName(), *Namespace);
-				return StringTable;
-			}
+
+	// Fallback: other name/path patterns (e.g. Name_Namespace, path containing namespace)
+	for (const FAssetData& AssetData : AssetList)
+	{
+		UStringTable* StringTable = Cast<UStringTable>(AssetData.GetAsset());
+		if (!StringTable)
+		{
+			continue;
+		}
+
+		FString StringTableName = StringTable->GetName();
+		FString StringTablePath = StringTable->GetPathName();
+
+		// Skip exact match (already handled above)
+		if (StringTableName == Namespace)
+		{
+			continue;
+		}
+
+		// Check for other valid namespace match in the name or path
+		if (StringTableName.EndsWith(FString::Printf(TEXT("_%s"), *Namespace)) ||
+			StringTablePath.Contains(FString::Printf(TEXT("/%s."), *Namespace)) ||
+			StringTablePath.Contains(FString::Printf(TEXT("/%s/"), *Namespace)) ||
+			StringTablePath.EndsWith(FString::Printf(TEXT("/%s"), *Namespace)) ||
+			StringTablePath.Contains(FString::Printf(TEXT("/%s"), *Namespace)))
+		{
+			UE_LOG(LogGridlyLocalizationServiceProvider, Display, TEXT("📋 Found existing string table: %s for namespace: %s"), *StringTablePath, *Namespace);
+			return StringTable;
 		}
 	}
 	

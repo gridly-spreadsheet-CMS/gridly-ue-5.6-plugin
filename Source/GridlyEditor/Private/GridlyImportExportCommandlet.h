@@ -21,6 +21,7 @@ struct FGridlySourceRecord
 {
 	FString RecordId;
 	FString SourceText;
+	FString Path;
 };
 
 /**

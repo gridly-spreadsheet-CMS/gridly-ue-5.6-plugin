@@ -620,6 +620,8 @@ void UGridlyImportExportCommandlet::OnDownloadSourceChangesFromGridly(FHttpReque
 
 	UE_LOG(LogGridlyImportExportCommandlet, Log, TEXT("Successfully parsed %d records from Gridly"), RecordsArray.Num());
 
+	const UGridlyGameSettings* GameSettings = GetMutableDefault<UGridlyGameSettings>();
+
 	// Process the records and group them by namespace
 	TMap<FString, TArray<FGridlySourceRecord>> NamespaceRecords;
 	
@@ -635,10 +637,16 @@ void UGridlyImportExportCommandlet::OnDownloadSourceChangesFromGridly(FHttpReque
 		FGridlySourceRecord SourceRecord;
 		SourceRecord.RecordId = RecordObj->GetStringField(TEXT("id"));
 		
+		// Path (namespace): top-level "path" first, then from path column in cells (NamespaceColumnId)
+		FString PathFromRecord;
+		if (RecordObj->TryGetStringField(TEXT("path"), PathFromRecord))
+		{
+			SourceRecord.Path = PathFromRecord;
+		}
+
 		UE_LOG(LogGridlyImportExportCommandlet, Log, TEXT("Processing record ID: %s"), *SourceRecord.RecordId);
 		
-		// Get the source text from the native culture column
-		// Handle the case where cells might be null, an array, or an object
+		// Get source text and path (namespace) from cells
 		if (RecordObj->HasField(TEXT("cells")))
 		{
 			const TSharedPtr<FJsonValue> CellsValue = RecordObj->TryGetField(TEXT("cells"));
@@ -649,13 +657,10 @@ void UGridlyImportExportCommandlet::OnDownloadSourceChangesFromGridly(FHttpReque
 				{
 					const TArray<TSharedPtr<FJsonValue>> CellsArray = CellsValue->AsArray();
 					
-					// Look for the source culture column
-					FString SourceColumnId = FString::Printf(TEXT("src_%s"), *CurrentSourceDownloadCulture);
-					SourceColumnId = SourceColumnId.Replace(TEXT("-"), TEXT(""));
+					FString SourceColumnId = FString::Printf(TEXT("%s%s"), *GameSettings->SourceLanguageColumnIdPrefix, *CurrentSourceDownloadCulture.Replace(TEXT("-"), TEXT("")));
 					
 					UE_LOG(LogGridlyImportExportCommandlet, Log, TEXT("Looking for source column ID: %s in %d cells"), *SourceColumnId, CellsArray.Num());
 					
-					// Search through the cells array for the matching column ID
 					for (const TSharedPtr<FJsonValue>& CellValue : CellsArray)
 					{
 						if (CellValue.IsValid() && !CellValue->IsNull())
@@ -664,9 +669,15 @@ void UGridlyImportExportCommandlet::OnDownloadSourceChangesFromGridly(FHttpReque
 							if (CellObj.IsValid())
 							{
 								FString CellColumnId = CellObj->GetStringField(TEXT("columnId"));
-								if (CellColumnId == SourceColumnId)
+								FString CellValueStr = CellObj->GetStringField(TEXT("value"));
+								// Path/namespace from path column (NamespaceColumnId)
+								if (!GameSettings->NamespaceColumnId.IsEmpty() && CellColumnId == GameSettings->NamespaceColumnId)
 								{
-									SourceRecord.SourceText = CellObj->GetStringField(TEXT("value"));
+									SourceRecord.Path = CellValueStr;
+								}
+								else if (CellColumnId == SourceColumnId)
+								{
+									SourceRecord.SourceText = CellValueStr;
 									UE_LOG(LogGridlyImportExportCommandlet, Log, TEXT("Found source text for record %s: %s"), *SourceRecord.RecordId, *SourceRecord.SourceText);
 									break;
 								}
@@ -680,12 +691,23 @@ void UGridlyImportExportCommandlet::OnDownloadSourceChangesFromGridly(FHttpReque
 					const TSharedPtr<FJsonObject> CellsObj = CellsValue->AsObject();
 					if (CellsObj.IsValid())
 					{
-						// Look for the source culture column
-						FString SourceColumnId = FString::Printf(TEXT("src_%s"), *CurrentSourceDownloadCulture);
-						SourceColumnId = SourceColumnId.Replace(TEXT("-"), TEXT(""));
+						FString SourceColumnId = FString::Printf(TEXT("%s%s"), *GameSettings->SourceLanguageColumnIdPrefix, *CurrentSourceDownloadCulture.Replace(TEXT("-"), TEXT("")));
 						
 						UE_LOG(LogGridlyImportExportCommandlet, Log, TEXT("Looking for source column ID: %s (object format)"), *SourceColumnId);
 						
+						// Path from NamespaceColumnId if present
+						if (!GameSettings->NamespaceColumnId.IsEmpty() && CellsObj->HasField(GameSettings->NamespaceColumnId))
+						{
+							const TSharedPtr<FJsonValue> PathCellValue = CellsObj->TryGetField(GameSettings->NamespaceColumnId);
+							if (PathCellValue.IsValid() && !PathCellValue->IsNull())
+							{
+								const TSharedPtr<FJsonObject> PathCellObj = PathCellValue->AsObject();
+								if (PathCellObj.IsValid())
+								{
+									SourceRecord.Path = PathCellObj->GetStringField(TEXT("value"));
+								}
+							}
+						}
 						if (CellsObj->HasField(SourceColumnId))
 						{
 							const TSharedPtr<FJsonValue> CellValue = CellsObj->TryGetField(SourceColumnId);
@@ -704,11 +726,11 @@ void UGridlyImportExportCommandlet::OnDownloadSourceChangesFromGridly(FHttpReque
 			}
 		}
 
-		// Determine namespace from record ID (assuming format "Namespace,Key")
-		FString Namespace = TEXT("Default");
+		// Determine namespace: use path from API (cells or top-level), or from record ID when using combined namespace
+		FString Namespace = SourceRecord.Path;
 		FString Key = SourceRecord.RecordId;
 		
-		if (SourceRecord.RecordId.Contains(TEXT(",")))
+		if (GameSettings->bUseCombinedNamespaceId && SourceRecord.RecordId.Contains(TEXT(",")))
 		{
 			FString Left, Right;
 			if (SourceRecord.RecordId.Split(TEXT(","), &Left, &Right))
@@ -716,6 +738,12 @@ void UGridlyImportExportCommandlet::OnDownloadSourceChangesFromGridly(FHttpReque
 				Namespace = Left;
 				Key = Right;
 			}
+		}
+		
+		Namespace = Namespace.Replace(TEXT(" "), TEXT(""));
+		if (Namespace.IsEmpty())
+		{
+			Namespace = TEXT("Default");
 		}
 		
 		// Log if we didn't find any source text

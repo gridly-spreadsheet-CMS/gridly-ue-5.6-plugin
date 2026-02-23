@@ -137,6 +137,10 @@ public:
 	// Source changes download tracking
 	TWeakObjectPtr<ULocalizationTarget> CurrentSourceDownloadTarget;
 	FString CurrentSourceDownloadCulture;
+	/** Pagination: accumulated records across pages so we get all namespaces */
+	TMap<FString, TArray<FGridlySourceRecord>> AccumulatedSourceDownloadNamespaceRecords;
+	int32 CurrentSourceDownloadOffset = 0;
+	int32 CurrentSourceDownloadTotalCount = 0;
 public:
 	void DownloadSourceChangesFromGridlyInternal(TWeakObjectPtr<ULocalizationTarget> LocalizationTarget, const FString& NativeCulture);
 	void ProcessSourceChangesForNamespaces(const TMap<FString, TArray<FGridlySourceRecord>>& NamespaceRecords);

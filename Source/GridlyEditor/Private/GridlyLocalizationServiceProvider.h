@@ -145,6 +145,8 @@ public:
 	void DownloadSourceChangesFromGridlyInternal(TWeakObjectPtr<ULocalizationTarget> LocalizationTarget, const FString& NativeCulture);
 	void ProcessSourceChangesForNamespaces(const TMap<FString, TArray<FGridlySourceRecord>>& NamespaceRecords);
 	bool ImportCSVToStringTable(ULocalizationTarget* LocalizationTarget, const FString& Namespace, const FString& CSVFilePath);
+	/** Parse CSV content into logical rows; newlines inside quoted fields are preserved as part of the value */
+	void ParseCSVIntoLogicalRows(const FString& CSVContent, TArray<FString>& OutRows);
 	void ParseCSVLine(const FString& Line, TArray<FString>& OutFields);
 	
 

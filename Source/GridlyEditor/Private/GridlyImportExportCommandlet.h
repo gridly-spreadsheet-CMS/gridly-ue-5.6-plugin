@@ -58,6 +58,7 @@ private:
 	void OnDownloadSourceChangesFromGridly(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bSuccess);
 	void ProcessSourceChangesForNamespaces(const TMap<FString, TArray<FGridlySourceRecord>>& NamespaceRecords);
 	bool ImportCSVToStringTable(ULocalizationTarget* LocalizationTarget, const FString& Namespace, const FString& CSVFilePath);
+	void ParseCSVIntoLogicalRows(const FString& CSVContent, TArray<FString>& OutRows);
 	void ParseCSVLine(const FString& Line, TArray<FString>& OutFields);
 	bool UpdateStringTableEntry(ULocalizationTarget* LocalizationTarget, const FString& Namespace, const FString& Key, const FString& SourceString);
 };

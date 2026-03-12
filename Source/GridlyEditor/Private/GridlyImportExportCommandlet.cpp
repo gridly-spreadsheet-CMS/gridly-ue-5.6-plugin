@@ -911,25 +911,29 @@ bool UGridlyImportExportCommandlet::ImportCSVToStringTable(ULocalizationTarget* 
 	UE_LOG(LogGridlyImportExportCommandlet, Log, TEXT("CSV file ready for import: %s"), *CSVFilePath);
 	UE_LOG(LogGridlyImportExportCommandlet, Log, TEXT("Namespace: %s, Target: %s"), *Namespace, *LocalizationTarget->Settings.Name);
 	
-	// Parse the CSV file (same as UI implementation)
-	TArray<FString> CSVLines;
-	if (!FFileHelper::LoadFileToStringArray(CSVLines, *CSVFilePath))
+	// Load entire CSV file (LoadFileToStringArray splits on every newline and would break values with embedded newlines)
+	FString CSVContent;
+	if (!FFileHelper::LoadFileToString(CSVContent, *CSVFilePath))
 	{
 		UE_LOG(LogGridlyImportExportCommandlet, Error, TEXT("❌ Failed to read CSV file: %s"), *CSVFilePath);
 		return false;
 	}
 
-	if (CSVLines.Num() < 2) // Need at least header + 1 data row
+	// Parse into logical rows (newlines inside quoted fields are preserved as part of the value)
+	TArray<FString> CSVRows;
+	ParseCSVIntoLogicalRows(CSVContent, CSVRows);
+
+	if (CSVRows.Num() < 2) // Need at least header + 1 data row
 	{
 		UE_LOG(LogGridlyImportExportCommandlet, Warning, TEXT("⚠️ CSV file is empty or has no data rows: %s"), *CSVFilePath);
 		return false;
 	}
 
 	// Parse CSV header
-	FString HeaderLine = CSVLines[0];
+	FString HeaderLine = CSVRows[0];
 	TArray<FString> HeaderFields;
 	HeaderLine.ParseIntoArray(HeaderFields, TEXT(","));
-	
+
 	if (HeaderFields.Num() < 2)
 	{
 		UE_LOG(LogGridlyImportExportCommandlet, Error, TEXT("❌ Invalid CSV header format: %s"), *HeaderLine);
@@ -943,25 +947,24 @@ bool UGridlyImportExportCommandlet::ImportCSVToStringTable(ULocalizationTarget* 
 		return false;
 	}
 
-	// Parse CSV data into key-value pairs
+	// Parse CSV data into key-value pairs (each logical row may span multiple physical lines when values contain newlines)
 	TMap<FString, FString> KeyValuePairs;
-	for (int32 i = 1; i < CSVLines.Num(); ++i)
+	for (int32 i = 1; i < CSVRows.Num(); ++i)
 	{
-		FString Line = CSVLines[i];
-		if (Line.IsEmpty())
+		const FString& Row = CSVRows[i];
+		if (Row.IsEmpty())
 		{
 			continue;
 		}
 
-		// Simple CSV parsing (handles quoted fields)
 		TArray<FString> Fields;
-		ParseCSVLine(Line, Fields);
-		
+		ParseCSVLine(Row, Fields);
+
 		if (Fields.Num() >= 2)
 		{
 			FString Key = Fields[0].TrimQuotes();
 			FString Value = Fields[1].TrimQuotes();
-			
+
 			if (!Key.IsEmpty() && !Value.IsEmpty())
 			{
 				KeyValuePairs.Add(Key, Value);
@@ -1012,10 +1015,75 @@ bool UGridlyImportExportCommandlet::ImportCSVToStringTable(ULocalizationTarget* 
 	return false;
 }
 
+void UGridlyImportExportCommandlet::ParseCSVIntoLogicalRows(const FString& CSVContent, TArray<FString>& OutRows)
+{
+	OutRows.Empty();
+	const TCHAR QuoteChar = TEXT('"');
+
+	bool bInsideQuotes = false;
+	FString CurrentRow;
+
+	for (int32 i = 0; i < CSVContent.Len(); ++i)
+	{
+		const TCHAR Char = CSVContent[i];
+
+		if (Char == QuoteChar)
+		{
+			if (bInsideQuotes && i + 1 < CSVContent.Len() && CSVContent[i + 1] == QuoteChar)
+			{
+				CurrentRow += QuoteChar;
+				++i;
+			}
+			else
+			{
+				bInsideQuotes = !bInsideQuotes;
+				CurrentRow += Char;
+			}
+		}
+		else if (Char == TEXT('\n'))
+		{
+			if (!bInsideQuotes)
+			{
+				OutRows.Add(CurrentRow);
+				CurrentRow.Empty();
+			}
+			else
+			{
+				CurrentRow += Char;
+			}
+		}
+		else if (Char == TEXT('\r'))
+		{
+			if (!bInsideQuotes)
+			{
+				if (i + 1 < CSVContent.Len() && CSVContent[i + 1] == TEXT('\n'))
+				{
+					++i;
+				}
+				OutRows.Add(CurrentRow);
+				CurrentRow.Empty();
+			}
+			else
+			{
+				CurrentRow += Char;
+			}
+		}
+		else
+		{
+			CurrentRow += Char;
+		}
+	}
+
+	if (!CurrentRow.IsEmpty())
+	{
+		OutRows.Add(CurrentRow);
+	}
+}
+
 void UGridlyImportExportCommandlet::ParseCSVLine(const FString& Line, TArray<FString>& OutFields)
 {
 	OutFields.Empty();
-	
+
 	FString CurrentField;
 	bool bInQuotes = false;
 	
